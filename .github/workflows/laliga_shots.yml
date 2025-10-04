@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pandas requests
+      - run: pip install pandas requests beautifulsoup4 lxml
       - run: python build_laliga_player_shots.py   # el .py está en la RAÍZ
       - name: Commit CSV
         run: |
