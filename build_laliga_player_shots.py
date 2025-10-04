@@ -1,4 +1,4 @@
-# build_laliga_player_shots.py
+# build_laliga_player_shots.py  — robusto ante vacíos/rate limit
 import re, json, html, os, time, requests
 import pandas as pd
 
@@ -22,7 +22,8 @@ def url_variants(path: str):
         f"https://r.jina.ai/https://understat.com/{p}",
     ]
 
-def get_page(path: str, retries=2, timeout=25, sleep=0.5) -> str:
+def get_page(path: str, retries=2, timeout=25, sleep=0.7) -> str:
+    last_exc = None
     for u in url_variants(path):
         for _ in range(retries + 1):
             try:
@@ -31,13 +32,15 @@ def get_page(path: str, retries=2, timeout=25, sleep=0.5) -> str:
                 t = r.text or ""
                 if t.strip():
                     return t
-            except Exception:
+            except Exception as e:
+                last_exc = e
                 time.sleep(sleep)
     return ""
 
 def extract_json_var(html_text: str, var_name: str):
     if not html_text:
         return None
+    # JSON.parse('...')
     m = re.search(
         rf"{re.escape(var_name)}\s*=\s*JSON\.parse\('(?P<enc>(?:\\.|[^\\'])*?)'\)\s*;",
         html_text, flags=re.DOTALL
@@ -45,6 +48,7 @@ def extract_json_var(html_text: str, var_name: str):
     if m:
         enc = m.group("enc")
         if enc.strip():
+            # decode normal
             try:
                 s1 = json.loads(enc)
                 if isinstance(s1, str) and s1.strip() and s1.strip()[0] in "[{":
@@ -54,6 +58,7 @@ def extract_json_var(html_text: str, var_name: str):
                         pass
             except Exception:
                 pass
+            # fallback unicode_escape + html
             try:
                 s2 = bytes(enc, "utf-8").decode("unicode_escape")
                 s2 = html.unescape(s2)
@@ -61,6 +66,7 @@ def extract_json_var(html_text: str, var_name: str):
                     return json.loads(s2)
             except Exception:
                 pass
+    # array/objeto crudo
     m2 = re.search(
         rf"{re.escape(var_name)}\s*=\s*(?P<raw>\[.*?\]|\{{.*?\}})\s*;",
         html_text, flags=re.DOTALL
@@ -72,35 +78,45 @@ def extract_json_var(html_text: str, var_name: str):
             return None
     return None
 
-# 1) lista de partidos
+print("▶️ Descargando lista de partidos...")
 league_html = get_page(f"league/{LEAGUE}/{SEASON}")
 matches = extract_json_var(league_html, "matchesData") or []
 match_ids = [str(m.get("id")) for m in matches if m.get("id") is not None]
+print(f"ℹ️ Partidos detectados: {len(match_ids)}")
 
-# 2) acumular tiros por jugador
-agg = {}  # pid -> dict
-for mid in match_ids:
-    h = get_page(f"match/{mid}")
-    shots = extract_json_var(h, "shotsData")
-    if not isinstance(shots, list):
-        continue
-    for s in shots:
-        pid = s.get("player_id")
-        pname = s.get("player")
-        if not pid or not pname:
+agg = {}  # pid -> dict {player_id, player_name, shots_total, shots_on_target}
+
+if match_ids:
+    for i, mid in enumerate(match_ids, 1):
+        if i % 20 == 0:
+            print(f"  … {i}/{len(match_ids)} partidos")
+        h = get_page(f"match/{mid}")
+        shots = extract_json_var(h, "shotsData")
+        if not isinstance(shots, list):
             continue
-        rec = agg.get(pid)
-        if rec is None:
-            rec = {"player_id": int(pid), "player_name": pname, "shots_total": 0, "shots_on_target": 0}
-        rec["shots_total"] += 1
-        if s.get("result") in ("Goal", "SavedShot"):
-            rec["shots_on_target"] += 1
-        agg[pid] = rec
+        for s in shots:
+            pid = s.get("player_id")
+            pname = s.get("player")
+            if not pid or not pname:
+                continue
+            rec = agg.get(pid)
+            if rec is None:
+                rec = {"player_id": int(pid), "player_name": pname, "shots_total": 0, "shots_on_target": 0}
+            rec["shots_total"] += 1
+            if s.get("result") in ("Goal", "SavedShot"):
+                rec["shots_on_target"] += 1
+            agg[pid] = rec
 
-df = pd.DataFrame(list(agg.values())).sort_values(
-    ["shots_total", "shots_on_target"], ascending=[False, False]
-).reset_index(drop=True)
+# Siempre crea el DF con columnas definidas
+cols = ["player_id","player_name","shots_total","shots_on_target"]
+df = pd.DataFrame(list(agg.values()), columns=cols)
+
+if not df.empty:
+    df = df.sort_values(["shots_total", "shots_on_target"], ascending=[False, False]).reset_index(drop=True)
+else:
+    # deja DF vacío con encabezados (no falla el commit ni PBI)
+    df = pd.DataFrame(columns=cols)
 
 os.makedirs("out", exist_ok=True)
 df.to_csv("out/laliga_2025_player_shots.csv", index=False)
-print(f"✅ rows: {len(df)}  → out/laliga_2025_player_shots.csv")
+print(f"✅ filas escritas: {len(df)}  → out/laliga_2025_player_shots.csv")
