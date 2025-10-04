@@ -1,8 +1,9 @@
-# build_laliga_player_shots.py  — Fuente principal: FBref (fallback: Understat)
-import os, re, io, time, html, json, requests
+# build_laliga_player_shots.py — FBref (mirror) → CSV tiros por jugador
+import os, re, time, io, html, json, requests
 import pandas as pd
+from bs4 import BeautifulSoup
 
-SEASON_LABEL = "2025-2026"   # etiqueta que aparece en FBref
+SEASON_LABEL = "2025-2026"   # así aparece en FBref
 LEAGUE_NAME  = "La Liga"
 
 session = requests.Session()
@@ -14,106 +15,127 @@ session.headers.update({
     "Connection": "keep-alive",
 })
 
-def get(url, retries=2, sleep=0.6, timeout=25):
+def get_html(url, retries=2, sleep=0.6, timeout=25):
+    """Intenta primero con el mirror r.jina.ai y luego directo."""
+    variants = [
+        "https://r.jina.ai/" + url,
+        url
+    ]
     last = None
-    for _ in range(retries + 1):
-        try:
-            r = session.get(url, timeout=timeout)
-            r.raise_for_status()
-            return r.text
-        except Exception as e:
-            last = e
-            time.sleep(sleep)
+    for u in variants:
+        for _ in range(retries + 1):
+            try:
+                r = session.get(u, timeout=timeout)
+                r.raise_for_status()
+                t = r.text
+                if t and t.strip():
+                    return t.replace("<!--", "").replace("-->", "")
+            except Exception as e:
+                last = e
+                time.sleep(sleep)
     return None
 
-def parse_fbref_shooting(html_text: str) -> pd.DataFrame:
+def to_num(x):
+    if x is None:
+        return None
+    s = str(x).strip().replace(",", "")
+    m = re.search(r"-?\d+(?:\.\d+)?", s)
+    return float(m.group()) if m else None
+
+def parse_shooting_table(html_text):
+    """Devuelve lista de dicts con los campos de la tabla #stats_shooting."""
     if not html_text:
-        return pd.DataFrame()
-    # FBref mete tablas dentro de comentarios
-    clean = html_text.replace("<!--", "").replace("-->", "")
-    # Extraer tabla por id
-    try:
-        tables = pd.read_html(io.StringIO(clean), attrs={"id": "stats_shooting"})
-        if not tables:
-            return pd.DataFrame()
-        df = tables[0]
-    except Exception:
-        return pd.DataFrame()
+        return []
+    soup = BeautifulSoup(html_text, "lxml")
+    table = soup.find("table", {"id": "stats_shooting"})
+    if not table or not table.tbody:
+        return []
+    rows = []
+    for tr in table.tbody.find_all("tr"):
+        if tr.get("class") and "thead" in tr.get("class"):
+            continue
+        td = lambda stat: tr.find("td", {"data-stat": stat})
 
-    # Aplanar encabezados si vienen como MultiIndex
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = [c[-1] for c in df.columns]
+        player = td("player").get_text(strip=True) if td("player") else None
+        squad  = td("team").get_text(strip=True)   if td("team") else None
+        comp   = td("comp").get_text(strip=True)   if td("comp") else None
+        season = td("season").get_text(strip=True) if td("season") else None
 
-    # Limpiar filas cabecera/total
-    for col in ["Player", "Squad"]:
-        if col in df.columns:
-            df = df[df[col].notna() & (df[col] != col)]
-    if "Squad" in df.columns:
-        df = df[~df["Squad"].str.fullmatch("Squad Total", case=False, na=False)]
+        if not player or player == "Player":
+            continue
+        if squad and squad.lower() == "squad total":
+            continue
 
-    # Si hay columna 'Comp' (competición), filtra La Liga
-    if "Comp" in df.columns:
-        df = df[df["Comp"].str.fullmatch(LEAGUE_NAME, case=False, na=False)]
+        shots_total  = to_num((td("shots_total") or td("shots")).get_text(strip=True) if (td("shots_total") or td("shots")) else None)
+        shots_on     = to_num(td("shots_on_target").get_text(strip=True) if td("shots_on_target") else None)
+        n90          = to_num((td("minutes_90s") or td("90s")).get_text(strip=True) if (td("minutes_90s") or td("90s")) else None)
+        sot_pct      = to_num((td("shots_on_target_pct") or td("sot%")).get_text(strip=True) if (td("shots_on_target_pct") or td("sot%")) else None)
+        sh90         = to_num((td("shots_total_per90") or td("sh/90")).get_text(strip=True) if (td("shots_total_per90") or td("sh/90")) else None)
+        sot90        = to_num((td("shots_on_target_per90") or td("sot/90")).get_text(strip=True) if (td("shots_on_target_per90") or td("sot/90")) else None)
 
-    # Si hay columna 'Season', filtra temporada
-    if "Season" in df.columns:
-        df = df[df["Season"].astype(str).str.strip() == SEASON_LABEL]
+        rows.append({
+            "player_name": player,
+            "squad": squad,
+            "comp": comp,
+            "season": season,
+            "shots_total": shots_total,
+            "shots_on_target": shots_on,
+            "ninety": n90,
+            "sot_pct": sot_pct,
+            "shots_per90": sh90,
+            "sot_per90": sot90,
+        })
+    return rows
 
-    # Renombrar y convertir
-    rename = {
-        "Player":"player_name",
-        "Squad":"squad",
-        "Sh":"shots_total",
-        "SoT":"shots_on_target",
-        "90s":"ninety",
-        "SoT%":"sot_pct",
-        "Sh/90":"shots_per90",
-        "SoT/90":"sot_per90"
-    }
-    for k,v in rename.items():
-        if k not in df.columns:  # coalesce por si FBref cambia
-            # alternativas frecuentes
-            alt = {"Sh":"shots", "SoT":"sot"}
-            if k in alt and alt[k] in df.columns:
-                df[v] = pd.to_numeric(df[alt[k]], errors="coerce")
-                continue
-        else:
-            df[v] = pd.to_numeric(df[k], errors="coerce") if k not in ["Player","Squad"] else df[k]
+def build_df(rows):
+    if not rows:
+        return pd.DataFrame(columns=[
+            "player_name","squad","shots_total","shots_on_target","ninety","sot_pct","shots_per90","sot_per90"
+        ])
+    df = pd.DataFrame(rows)
 
-    keep = ["player_name","squad","shots_total","shots_on_target","ninety","sot_pct","shots_per90","sot_per90"]
-    for c in keep:
-        if c not in df.columns:
-            df[c] = pd.NA
+    # filtros (si las columnas existen)
+    if "comp" in df.columns:
+        df = df[df["comp"].fillna("").str.lower() == LEAGUE_NAME.lower()]
+    if "season" in df.columns:
+        df = df[df["season"].fillna("").str.strip() == SEASON_LABEL]
 
-    # Agregar por jugador (por si aparece con varios equipos)
-    out = (df.groupby(["player_name","squad"], dropna=False)
-             [["shots_total","shots_on_target","ninety","sot_pct","shots_per90","sot_per90"]]
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "player_name","squad","shots_total","shots_on_target","ninety","sot_pct","shots_per90","sot_per90"
+        ])
+
+    # agregar por jugador + equipo
+    num_cols = ["shots_total","shots_on_target","ninety","sot_pct","shots_per90","sot_per90"]
+    for c in num_cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    out = (df.groupby(["player_name","squad"], dropna=False)[num_cols]
              .sum(min_count=1)
              .reset_index())
 
-    # Ordenar
     out = out.sort_values(["shots_total","shots_on_target"], ascending=[False, False]).reset_index(drop=True)
     return out
 
-# --------- 1) Intento: página específica de LaLiga 2025-26 ----------
-url_specific = "https://fbref.com/en/comps/12/2025-2026/shooting/players/2025-2026-La-Liga-Stats"
-html_specific = get(url_specific)
+# URLs: específica y Big-5 (fallback)
+URL_SPEC = "https://fbref.com/en/comps/12/2025-2026/shooting/players/2025-2026-La-Liga-Stats"
+URL_BIG5 = "https://fbref.com/en/comps/Big5/shooting/players/Big-5-European-Leagues-Stats"
 
-df_fbref = parse_fbref_shooting(html_specific)
+print("▶️ Descargando tabla específica LaLiga 2025-26…")
+h1 = get_html(URL_SPEC)
+rows = parse_shooting_table(h1)
+print(f"   Filas leídas (spec): {len(rows)}")
 
-# --------- 2) Fallback: Big-5 players shooting (filtrando LaLiga) ----
-if df_fbref.empty:
-    url_big5 = "https://fbref.com/en/comps/Big5/shooting/players/Big-5-European-Leagues-Stats"
-    html_big5 = get(url_big5)
-    df_fbref = parse_fbref_shooting(html_big5)
+if not rows:
+    print("▶️ Fallback: Big-5 players shooting…")
+    h2 = get_html(URL_BIG5)
+    rows = parse_shooting_table(h2)
+    print(f"   Filas leídas (big5): {len(rows)}")
 
-# --------- 3) Si sigue vacío, dejamos CSV con cabeceras (sin romper) ---
-if df_fbref.empty:
-    df_fbref = pd.DataFrame(columns=[
-        "player_name","squad","shots_total","shots_on_target","ninety","sot_pct","shots_per90","sot_per90"
-    ])
+df = build_df(rows)
+print(f"✅ Filas LaLiga post-filtro: {len(df)}")
 
-# Guardar
 os.makedirs("out", exist_ok=True)
-df_fbref.to_csv("out/laliga_2025_player_shots.csv", index=False)
-print(f"✅ filas escritas: {len(df_fbref)} → out/laliga_2025_player_shots.csv")
+df.to_csv("out/laliga_2025_player_shots.csv", index=False)
+print("📝 Escrito: out/laliga_2025_player_shots.csv")
